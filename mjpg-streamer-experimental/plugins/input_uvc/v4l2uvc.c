@@ -87,6 +87,9 @@ int xioctl(int fd, int IOCTL_X, void *arg)
 }
 
 static int init_v4l2(struct vdIn *vd);
+static int set_stream_params(struct vdIn *vd);
+static int stream_params_sane(struct vdIn *vd, unsigned int *sizeimage,
+                              struct v4l2_fract *tpf);
 static int init_buffers(struct vdIn *vd);
 static int init_framebuffer(struct vdIn *vd);
 static void free_framebuffer(struct vdIn *vd);
@@ -324,6 +327,125 @@ static int init_v4l2(struct vdIn *vd)
     }
 
     /*
+     * The camera sometimes answers the format and frame rate negotiation
+     * with garbage (seen: a 856 MB frame size, 45246 fps). The driver takes
+     * the frame size as is and REQBUFS then allocates that much kernel
+     * memory per buffer. Check what the camera agreed to and ask again,
+     * waiting longer each time: the bad answers may last a few seconds.
+     */
+    for (i = 0; ; i++) {
+        static const unsigned int retry_ms[] = { 500, 1500, 3000 };
+        const int tries = sizeof(retry_ms) / sizeof(retry_ms[0]) + 1;
+        struct v4l2_fract tpf;
+        unsigned int sizeimage;
+
+        if (set_stream_params(vd) < 0)
+            goto fatal;
+        if (stream_params_sane(vd, &sizeimage, &tpf))
+            break;
+        IPRINT("bogus stream parameters from the camera: sizeimage %u, fps %u/%u, %s\n",
+               sizeimage, tpf.denominator, tpf.numerator,
+               i + 1 < tries ? "retrying" : "giving up");
+        if (i + 1 == tries)
+            goto fatal;
+        usleep(retry_ms[i] * 1000);
+    }
+
+    if (init_buffers(vd) < 0)
+        goto fatal;
+    return 0;
+fatal:
+    fprintf(stderr, "Init v4L2 failed !! exit fatal\n");
+    return -1;
+}
+
+/*
+ * Is the frame size the driver will allocate plausible for the format, and
+ * is the frame interval within what the camera advertises? The advertised
+ * intervals come from the USB descriptors read at enumeration, not from the
+ * negotiation that went wrong. Returns the values checked in sizeimage and
+ * tpf (tpf zero if the driver has no frame interval).
+ */
+static int stream_params_sane(struct vdIn *vd, unsigned int *sizeimage,
+                              struct v4l2_fract *tpf)
+{
+    struct v4l2_format fmt;
+    struct v4l2_streamparm parm;
+    struct v4l2_frmivalenum ival;
+    unsigned long long limit;
+    int has_tpf;
+    double t, tmin = 1.0 / 240, tmax = 0; /* frame intervals, s; tmax 0: unknown */
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    *sizeimage = 0;
+    memset(tpf, 0, sizeof(*tpf));
+    if (xioctl(vd->fd, VIDIOC_G_FMT, &fmt) < 0) {
+        perror("Unable to get the format");
+        return 0;
+    }
+    *sizeimage = fmt.fmt.pix.sizeimage;
+    limit = (unsigned long long) vd->width * vd->height;
+    limit *= (vd->formatIn == V4L2_PIX_FMT_MJPEG || vd->formatIn == V4L2_PIX_FMT_JPEG) ? 3 : 4;
+    /* some cameras report one big frame size for all resolutions */
+    limit = MAX(limit, 4 << 20);
+
+    /* the interval the driver will commit at STREAMON, whether set or not */
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    has_tpf = xioctl(vd->fd, VIDIOC_G_PARM, &parm) == 0 &&
+              (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME);
+    if (has_tpf)
+        *tpf = parm.parm.capture.timeperframe;
+
+    if (*sizeimage == 0 || *sizeimage > limit)
+        return 0;
+    if (!has_tpf)
+        return 1;
+
+    if (tpf->numerator == 0 || tpf->denominator == 0)
+        return 0;
+    t = (double) tpf->numerator / tpf->denominator;
+
+    memset(&ival, 0, sizeof(ival));
+    ival.pixel_format = vd->formatIn;
+    ival.width = vd->width;
+    ival.height = vd->height;
+    while (xioctl(vd->fd, VIDIOC_ENUM_FRAMEINTERVALS, &ival) == 0) {
+        if (ival.type != V4L2_FRMIVAL_TYPE_DISCRETE) {
+            if (ival.stepwise.min.denominator && ival.stepwise.max.denominator) {
+                tmin = (double) ival.stepwise.min.numerator / ival.stepwise.min.denominator;
+                tmax = (double) ival.stepwise.max.numerator / ival.stepwise.max.denominator;
+            }
+            break;
+        }
+        if (ival.discrete.denominator) {
+            double d = (double) ival.discrete.numerator / ival.discrete.denominator;
+            if (tmax == 0 || d < tmin)
+                tmin = d;
+            if (d > tmax)
+                tmax = d;
+        }
+        ival.index++;
+    }
+
+    /* 1% slack for rounding of the fractions */
+    if (t < tmin * 0.99)
+        return 0;
+    if (tmax > 0 && t > tmax * 1.01)
+        return 0;
+    return 1;
+}
+
+/*
+ * Set the format and the frame rate. Each of S_FMT and S_PARM makes the
+ * driver negotiate with the camera.
+ */
+static int set_stream_params(struct vdIn *vd)
+{
+    int ret;
+
+    /*
      * set format in
      */
     memset(&vd->fmt, 0, sizeof(struct v4l2_format));
@@ -335,7 +457,7 @@ static int init_v4l2(struct vdIn *vd)
     ret = xioctl(vd->fd, VIDIOC_S_FMT, &vd->fmt);
     if(ret < 0) {
         fprintf(stderr, "Unable to set format: %d res: %dx%d\n", vd->formatIn, vd->width, vd->height);
-        goto fatal;
+        return -1;
     }
 
     /* 
@@ -382,8 +504,7 @@ static int init_v4l2(struct vdIn *vd)
 	vd->formatIn = vd->fmt.fmt.pix.pixelformat;
 	break;
       default:
-	goto fatal;
-	break;
+	return -1;
       }
     }
  
@@ -392,28 +513,26 @@ static int init_v4l2(struct vdIn *vd)
      */
 
     if (vd->fps != -1) {
-        struct v4l2_streamparm *setfps;
-        setfps = (struct v4l2_streamparm *) calloc(1, sizeof(struct v4l2_streamparm));
-        memset(setfps, 0, sizeof(struct v4l2_streamparm));
-        setfps->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        struct v4l2_streamparm parm = {0};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
         /*
         * first query streaming parameters to determine that the FPS selection is supported
         */
-        ret = xioctl(vd->fd, VIDIOC_G_PARM, setfps);
+        ret = xioctl(vd->fd, VIDIOC_G_PARM, &parm);
         if (ret == 0) {
-            if (setfps->parm.capture.capability & V4L2_CAP_TIMEPERFRAME) {
-                memset(setfps, 0, sizeof(struct v4l2_streamparm));
-                setfps->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                setfps->parm.capture.timeperframe.numerator = 1;
-                setfps->parm.capture.timeperframe.denominator = vd->fps==-1?255:vd->fps; // if no default fps set set it to maximum
+            if (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) {
+                memset(&parm, 0, sizeof(parm));
+                parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                parm.parm.capture.timeperframe.numerator = 1;
+                parm.parm.capture.timeperframe.denominator = vd->fps;
 
-                ret = xioctl(vd->fd, VIDIOC_S_PARM, setfps);
+                ret = xioctl(vd->fd, VIDIOC_S_PARM, &parm);
                 if (ret) {
                     perror("Unable to set the FPS\n");
                 } else {
-                    if (vd->fps != setfps->parm.capture.timeperframe.denominator) {
-                        IPRINT("FPS coerced ......: from %d to %d\n", vd->fps, setfps->parm.capture.timeperframe.denominator);
+                    if (vd->fps != parm.parm.capture.timeperframe.denominator) {
+                        IPRINT("FPS coerced ......: from %d to %d\n", vd->fps, parm.parm.capture.timeperframe.denominator);
                     }
                 }
             } else {
@@ -426,14 +545,7 @@ static int init_v4l2(struct vdIn *vd)
             perror("Unable to query that the FPS change is supported\n");
         }
     }
-
-    if (init_buffers(vd) < 0)
-        goto fatal;
     return 0;
-fatal:
-    fprintf(stderr, "Init v4L2 failed !! exit fatal\n");
-    return -1;
-
 }
 
 /* request, map and queue the capture buffers */
