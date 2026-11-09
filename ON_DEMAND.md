@@ -25,6 +25,13 @@ Only stopping the stream in the driver helps. Dropping frames in user space does
 
 All plugins see `struct _input`, and the patch adds fields to it. So `mjpg_streamer` and every plugin it loads must come from the same build.
 
+Not part of capture on demand, but in the same fork:
+
+| Commit | Change |
+|---|---|
+| `06bf5db` | **Retry on bogus stream parameters.** Now and then the AD5M camera answers the startup negotiation with garbage, such as a 856 MB frame size or 45246 fps, and uvcvideo would allocate that frame size per buffer. Before `REQBUFS`, `input_uvc` now checks the frame size and the frame interval against limits and the camera's advertised intervals. It negotiates again after 0.5, 1.5 and 3 s, then gives up. |
+| `924e624` | **Startup tests against a fake camera**, see [`tests/fake_uvc/README.md`](mjpg-streamer-experimental/tests/fake_uvc/README.md). |
+
 ## Usage
 
 ```
@@ -55,7 +62,7 @@ The test system:
 - camera: USB UVC `ab20:1276`, MJPG only, 640×480 at 20 fps, `-b 1`;
 - the printer was idle; snapshot polling ran on the printer itself with 3 clients, about 8 requests/s.
 
-The fake V4L2 device used for development is not part of this repo.
+The fake V4L2 device used while developing capture on demand is not part of this repo. The fake camera in [`tests/fake_uvc`](mjpg-streamer-experimental/tests/fake_uvc/README.md) tests only startup negotiation, not pausing and resuming.
 
 ### Capture paused vs running
 
@@ -90,32 +97,6 @@ Further checks, all passed:
 | this fork, without libv4l2 | 444 KB (PSS −0.36 MB) | 760 KB |
 | this fork + `MALLOC_ARENA_MAX=1 MALLOC_MMAP_THRESHOLD_=65536` | 504 KB | **528 KB** |
 
-## Building for the AD5M (chroot)
+## Building for the AD5M
 
-The target is armhf (hard float, ARMv7, VFPv4-D16) with glibc 2.40 and kernel 5.4. The binaries were built with the Ubuntu 24.04 `gcc-arm-linux-gnueabihf` cross toolchain (GCC 13.3, glibc 2.39), using this CMake toolchain file:
-
-```cmake
-set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR arm)
-set(CMAKE_C_COMPILER <xtools>/usr/bin/arm-linux-gnueabihf-gcc)
-set(CMAKE_SYSROOT <xtools>)
-set(CMAKE_FIND_ROOT_PATH <xtools>)
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-```
-
-Configure and build:
-
-```
-cd mjpg-streamer-experimental && mkdir _build-armhf && cd _build-armhf
-cmake -DCMAKE_TOOLCHAIN_FILE=<armhf.cmake> -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_FLAGS="-march=armv7-a -mfpu=vfpv4-d16 -mfloat-abi=hard -U_TIME_BITS" \
-      -DCMAKE_SKIP_RPATH=ON -DV4L2_LIB=V4L2_LIB-NOTFOUND ..
-make mjpg_streamer input_uvc output_http
-```
-
-- **`-U_TIME_BITS` is required.** Ubuntu's armhf compiler defaults to 64-bit `time_t`. That changes the size of `struct v4l2_buffer`, and with it the ioctl numbers of `VIDIOC_QUERYBUF`, `VIDIOC_QBUF` and `VIDIOC_DQBUF`. Kernel 5.4 lacks the time64 V4L2 ioctls and returns `ENOTTY` ("Unable to query buffer: Inappropriate ioctl for device").
-- **`-DV4L2_LIB=V4L2_LIB-NOTFOUND`** builds without libv4l2. An MJPG camera doesn't need it.
-- **`-DCMAKE_SKIP_RPATH=ON`** keeps build-host paths out of the binaries.
-- **Check the result:** `readelf -V` should require at most `GLIBC_2.38`, and `readelf -d` should list no RUNPATH.
+See [BUILD_AD5M.md](BUILD_AD5M.md): the cross toolchain, the CMake options (`-U_TIME_BITS` is required for kernel 5.4), checking the binaries, and installing them on the printer.
